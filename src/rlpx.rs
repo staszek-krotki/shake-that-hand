@@ -1,8 +1,18 @@
-use alloy_rlp::{Encodable, RlpDecodable, RlpEncodable};
+use std::borrow::Cow;
+use std::mem;
+use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 use bytes::{BufMut, BytesMut};
+use cipher::StreamCipher;
+use cipher::KeyIvInit;
 use secp256k1::{PublicKey, SECP256K1, SecretKey};
-use crate::ecies_crypto::Ecies;
+use crate::crypto::{keccak256_vec, KeccakStream};
+use crate::ecies_crypto::{Aes256Ctr64BE, Ecies};
 use crate::handshake_protocol::ecdh_x;
+use crate::message;
+
+pub const RLP_ZERO: u8 = 0x80;
+pub const RLP_EMPTY: u8 = 0xC0;
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, RlpDecodable, RlpEncodable)]
 pub struct AuthBody {
@@ -12,7 +22,34 @@ pub struct AuthBody {
     pub auth_vsn: u8
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, RlpDecodable, RlpEncodable)]
+pub struct AckBody {
+    pub recipient_ephemeral_public_key: [u8; 64],
+    pub recipient_nonce: [u8; 32],
+    pub ack_vsn: u8
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, RlpEncodable, RlpDecodable, Default, Hash)]
+pub struct Capability {
+    pub name: Cow<'static, str>,
+    pub version: usize,
+}
+
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, RlpDecodable, RlpEncodable)]
+pub struct Hello {
+    pub protocol_version: u8,
+    pub client_version: String,
+    pub capabilities: Vec<Capability>,
+    pub port: u16,
+    pub id: [u8;64],
+}
+
 pub struct Rlpx;
+
+
+#[derive(Debug)]
+pub struct RlpxError(pub String);
 
 impl Rlpx {
 
@@ -29,11 +66,10 @@ impl Rlpx {
         auth_body.encode(&mut bytes);
         bytes.extend_from_slice(padding);
 
-        Ecies::encrypt(bytes,peer_public_key )
+        Ecies::encrypt(bytes, peer_public_key)
     }
 
-
-    pub fn get_auth_body(secret_key: &SecretKey, id: [u8; 64], nonce: [u8; 32], ephemeral_secret_key: &SecretKey, peer_public_key: &PublicKey) -> AuthBody {
+    pub fn build_auth_body(secret_key: &SecretKey, id: [u8; 64], nonce: [u8; 32], ephemeral_secret_key: &SecretKey, peer_public_key: &PublicKey) -> AuthBody {
         let mut x = ecdh_x(&peer_public_key, &secret_key);
 
         //x ^= nonce
@@ -45,9 +81,6 @@ impl Rlpx {
                 &ephemeral_secret_key
             )
             .serialize_compact();
-
-        println!("sig: {:?}", sig);
-        println!("recover: {:?}", rec_id);
 
         let mut signature = BytesMut::with_capacity(65);
         signature.put_slice(&sig);
@@ -61,5 +94,164 @@ impl Rlpx {
         };
 
         auth_body
+    }
+
+    pub async fn decrypt_ack(buf: BytesMut, secret_key: &SecretKey) -> Result<AckBody, RlpxError> {
+        if buf.len() < 2 {
+            return Err(RlpxError("Ack too small".to_string()));
+        }
+
+        if let Ok(ack_body_bytes) = Ecies::decrypt(buf, secret_key) {
+            if let Ok(ack_body) = Self::build_ack_body(ack_body_bytes) {
+                return Ok(ack_body);
+            }
+        }
+        Err(RlpxError("Failed to decrypt Ack".to_string()))
+    }
+    fn build_ack_body(bytes: BytesMut) -> Result<AckBody, RlpxError> {
+        let ack: AckBody = Decodable::decode(&mut &*bytes).map_err(|_| RlpxError("failed to decode from".to_string()))?;
+        Ok(ack)
+    }
+
+    pub fn egress_hashers(nonce: &[u8; 32], auth_message: &BytesMut, ack: &AckBody, ephemeral_shared_secret: &[u8; 32]) -> (Aes256Ctr64BE, KeccakStream) {
+        let aes_secret: [u8; 32] = {
+            let h_nonce = keccak256_vec(vec![&ack.recipient_nonce, nonce]);
+            let shared_secret = keccak256_vec(vec![ephemeral_shared_secret, &h_nonce]);
+            keccak256_vec(vec![ephemeral_shared_secret, &shared_secret])
+        };
+        let mac_secret = keccak256_vec(vec![ephemeral_shared_secret, &aes_secret]);
+
+        println!("egress");
+        println!("mac secret: {}", hex::encode(&mac_secret));
+        println!("aes secret: {}", hex::encode(&aes_secret));
+
+
+        let iv = [0u8; 16];
+        let mut egress_aes = Aes256Ctr64BE::new(aes_secret.as_ref().into(), iv.as_ref().into());
+        let mut egress_mac = KeccakStream::new(mac_secret);
+
+        let mac_xor_nonce = {
+            let mut xor = mac_secret.clone();
+            xor.iter_mut().zip(ack.recipient_nonce).for_each(|(a, b)| *a ^= b);
+            xor
+        };
+        egress_mac.update(&mac_xor_nonce);
+        egress_mac.update(&auth_message);
+        (egress_aes, egress_mac)
+    }
+
+    pub fn ingress_hashers(nonce: &[u8; 32], ack_message: &BytesMut, ack: &AckBody, ephemeral_shared_secret: &[u8; 32]) -> (Aes256Ctr64BE, KeccakStream) {
+        let aes_secret: [u8; 32] = {
+            let h_nonce = keccak256_vec(vec![&ack.recipient_nonce, nonce]);
+            let shared_secret = keccak256_vec(vec![ephemeral_shared_secret, &h_nonce]);
+            keccak256_vec(vec![ephemeral_shared_secret, &shared_secret])
+        };
+        let mac_secret = keccak256_vec(vec![ephemeral_shared_secret, &aes_secret]);
+
+        println!("ingress");
+        println!("mac secret: {}", hex::encode(&mac_secret));
+        println!("aes secret: {}", hex::encode(&aes_secret));
+
+
+        let iv = [0u8; 16];
+        let mut ingress_aes = Aes256Ctr64BE::new(aes_secret.as_ref().into(), iv.as_ref().into());
+        let mut ingress_mac = KeccakStream::new(mac_secret);
+
+        println!("update remote_nonce: {}", hex::encode(&nonce));
+        println!("update init msg: {}", hex::encode(&ack_message));
+
+        let mac_xor_nonce = {
+            let mut xor = mac_secret.clone();
+            xor.iter_mut().zip(nonce).for_each(|(a, b)| *a ^= b);
+            xor
+        };
+        println!("update xor: {}", hex::encode(&mac_xor_nonce));
+        ingress_mac.update(&mac_xor_nonce);
+        ingress_mac.update(&ack_message);
+        (ingress_aes, ingress_mac)
+    }
+
+    pub fn build_hello(id: [u8;64]) -> BytesMut {
+        let mut hello_bytes = BytesMut::new();
+        hello_bytes.put_u8(RLP_ZERO); //hello message 0x00
+        Hello {
+            protocol_version: 5,
+            client_version: "shake-that-hand/0.1".to_string(),
+            capabilities: vec![
+                Capability {
+                    name: Cow::from("eth"),
+                    version: 66,
+                },
+                Capability {
+                    name: Cow::from("eth"),
+                    version: 67,
+                },
+                Capability {
+                    name: Cow::from("eth"),
+                    version: 68,
+                }
+            ],
+            port: 0,
+            id,
+        }.encode(&mut hello_bytes);
+        println!("Herllo bytes {}", hex::encode(&hello_bytes));
+        hello_bytes
+    }
+
+    pub fn hello_frame(bytes: BytesMut, mut egress_aes: &mut Aes256Ctr64BE, egress_mac: &mut KeccakStream) -> BytesMut {
+        let size = bytes.len();
+        let size_bytes = size.to_be_bytes();
+        let mut header = [0u8; 16];
+        header[0..3].copy_from_slice(&size_bytes[mem::size_of_val(&size)-3..mem::size_of_val(&size)]);
+        header[3..6].copy_from_slice(&[RLP_EMPTY+2, RLP_ZERO, RLP_ZERO]); // rlp encoded 2 element array with zeros
+
+        egress_aes.apply_keystream(&mut header);
+        egress_mac.accumulate_with_xor(&header);
+        let mac_digest = egress_mac.digest();
+
+        let mut output = BytesMut::new();
+        output.extend_from_slice(&header);
+        output.extend_from_slice(&mac_digest);
+
+        let initial_len = output.len();
+        //round up to 16 multiplication
+        let padding_len = ((bytes.len() + 15) & !15) - bytes.len();
+        let padding = vec![0u8; padding_len];
+
+        output.extend_from_slice(&bytes);
+        output.extend_from_slice(padding.as_slice());
+        let mut padded_bytes = &mut output[initial_len..];
+
+        egress_aes.apply_keystream(&mut padded_bytes);
+        egress_mac.update_accumulate_with_xor(&padded_bytes);
+        let digest = egress_mac.digest();
+
+        output.extend_from_slice(&digest);
+        output
+    }
+
+    pub(crate) fn read_hello_frame(mut bytes: BytesMut, ingress_aes: &mut Aes256Ctr64BE, ingress_mac: &mut KeccakStream) -> Result<(), RlpxError> {
+        let (header_bytes, mac_bytes) = bytes.split_at_mut(16);
+        let (mac_bytes, body) = mac_bytes.split_at_mut(16);
+        // let header = HeaderBytes::from_mut_slice(header_bytes);
+        // let mac = B128::from_slice(&mac_bytes[..16]);
+        println!("Header bytes {}", hex::encode(&header_bytes));
+        println!("Digest before apply {}", hex::encode(&ingress_mac.digest()));
+
+        ingress_mac.accumulate_with_xor(header_bytes);
+        let digest = ingress_mac.digest();
+        if mac_bytes != digest {
+            return Err(RlpxError("digest mismatch".to_string()));
+        }
+
+        ingress_aes.apply_keystream(header_bytes);
+
+        let mut size_bytes = [0u8; 8];
+        size_bytes[5..8].clone_from_slice(&header_bytes[0..3]);
+        let size = usize::from_be_bytes(size_bytes);
+        let padded_size = (size + 15) & !15;
+
+
+        Ok(())
     }
 }
