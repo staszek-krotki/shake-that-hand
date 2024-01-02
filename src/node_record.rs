@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::str::FromStr;
 use alloy_rlp::{RlpDecodable, RlpEncodable};
-use url::Url;
+use url::{Host, Url};
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, RlpEncodable, RlpDecodable)]
 pub struct NodeRecord {
@@ -42,17 +42,6 @@ impl FromStr for NodeRecord {
         })
     }
 }
-//
-// impl Clone for NodeRecord {
-//     fn clone(&self) -> Self {
-//         NodeRecord {
-//             id: self.id.clone(),
-//             address: self.address.clone(),
-//             tcp_port: self.tcp_port,
-//             udp_port: self.udp_port,
-//         }
-//     }
-// }
 
 impl From<NodeRecord> for SocketAddr {
     fn from(nr: NodeRecord) -> Self {
@@ -63,5 +52,32 @@ impl From<NodeRecord> for SocketAddr {
 
         let addr = SocketAddr::V4(SocketAddrV4::new(addr_v4, nr.udp_port));
         addr
+    }
+}
+
+fn decode_hex(s: &str) -> [u8; 64] {
+    let r:Vec<u8> = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect();
+
+    let mut a = [0u8; 64];
+    a.copy_from_slice(r.as_slice());
+    a
+}
+
+impl From<Url> for NodeRecord {
+    fn from(enode: Url) -> Self {
+        let ip = match enode.host().unwrap() {
+            Host::Ipv4(addr) => IpAddr::V4(addr),
+            Host::Domain(d) => IpAddr::from_str(d).unwrap(),
+            Host::Ipv6(_) => panic!("Ipv6 not supported")
+        };
+        Self {
+            ip,
+            tcp_port: enode.port().unwrap(),
+            udp_port: enode.port().unwrap(),
+            node_id: decode_hex(enode.username()),
+        }
     }
 }

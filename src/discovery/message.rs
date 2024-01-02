@@ -5,7 +5,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use secp256k1::{SecretKey, SECP256K1};
 use std::ops::Add;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::net::NodeEndpoint;
+use super::net::NodeEndpoint;
 
 #[derive(Clone)]
 pub enum Message {

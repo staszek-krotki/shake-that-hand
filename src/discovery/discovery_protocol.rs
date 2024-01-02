@@ -1,12 +1,12 @@
 use crate::crypto::keccak256;
-use crate::message::Message;
+use super::message::Message;
 use crate::node_record::NodeRecord;
-use crate::packet::Packet;
+use crate::discovery::packet::Packet;
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use secp256k1::{SECP256K1, SecretKey};
 use std::time::Duration;
 use tokio::time::sleep;
-use crate::net::Net;
+use super::net::DiscoveryNet;
 
 pub struct DiscoveryProtocol {
     secret_key: SecretKey,
@@ -20,11 +20,11 @@ impl DiscoveryProtocol {
         DiscoveryProtocol { secret_key: sk }
     }
 
-    pub(crate) async fn discover_neighbours(&self, id: [u8; 64], net: &Net) -> Vec<NodeRecord> {
+    pub(crate) async fn find_neighbours(&self, id: [u8; 64], net: &DiscoveryNet) -> Vec<NodeRecord> {
         let mut neighbours: Vec<NodeRecord> = vec![];
 
-        // we're using udp, so just to give it a little resiliency - we try up to 3 times to send FindNode
-        // for each FindNode we try 3 times to get the Neighbours response
+        // we're using udp, so just to give it a little resiliency - try up to 3 times to send FindNode
+        // for each FindNode try 3 times to get the Neighbours response
         for _i in 0..3 {
             let msg = Message::new_find_node(id);
             let (packet, _find_node_hash) = self.encode_packet(msg);
@@ -48,8 +48,8 @@ impl DiscoveryProtocol {
         neighbours
     }
 
-    pub(crate) async fn init_discovery(&self, local_nr: NodeRecord, peer_nr: NodeRecord, net: &Net) {
-        let msg = Message::new_ping(local_nr.clone(), peer_nr.clone());
+    pub(crate) async fn init(&self, net: &DiscoveryNet) {
+        let msg = Message::new_ping(net.local_nr.clone(), net.peer_nr.clone());
         let (packet, ping_hash) = self.encode_packet(msg);
         net.send(packet).await;
 
@@ -76,7 +76,7 @@ impl DiscoveryProtocol {
         if let Ok(packet) = ping_receive {
             let (message, hash) = self.decode_packet(packet).expect("decode should not fail");
             if let Message::Ping(_ping) = message {
-                let msg = Message::new_pong(peer_nr.clone(), hash);
+                let msg = Message::new_pong(net.peer_nr.clone(), hash);
                 let (packet, _pong_hash) = self.encode_packet(msg);
                 net.send(packet).await;
                 //we need to give a little time to register our PONG or otherwise our next requests might be ignored
@@ -150,10 +150,10 @@ impl DiscoveryProtocol {
 mod tests {
     extern crate alloc;
 
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use rand::thread_rng;
     use super::*;
-    
+
     #[test]
     fn encode_decode_ping() {
         let from_nr = NodeRecord {
@@ -172,8 +172,8 @@ mod tests {
 
         let msg = Message::new_ping(from_nr, to_nr);
         let protocol = DiscoveryProtocol::new(SecretKey::new(&mut thread_rng()));
-        let (packet, hash) = protocol.encode_packet(msg.clone());
-        if let Ok((result, hash)) = protocol.decode_packet(packet) {
+        let (packet, _hash) = protocol.encode_packet(msg.clone());
+        if let Ok((result, _hash)) = protocol.decode_packet(packet) {
             if let Message::Ping(ping) = result {
                 match msg {
                     Message::Ping(msg_ping) => {
@@ -202,8 +202,8 @@ mod tests {
 
         let msg = Message::new_pong(to_nr, [5u8; 32]);
         let protocol = DiscoveryProtocol::new(SecretKey::new(&mut thread_rng()));
-        let (packet, hash) = protocol.encode_packet(msg.clone());
-        if let Ok((result, hash)) = protocol.decode_packet(packet) {
+        let (packet, _hash) = protocol.encode_packet(msg.clone());
+        if let Ok((result, _hash)) = protocol.decode_packet(packet) {
             if let Message::Pong(pong) = result {
                 match msg {
                     Message::Pong(msg_pong) => {
@@ -225,8 +225,8 @@ mod tests {
     fn encode_decode_find_node() {
         let msg = Message::new_find_node([5u8; 64]);
         let protocol = DiscoveryProtocol::new(SecretKey::new(&mut thread_rng()));
-        let (packet, hash) = protocol.encode_packet(msg.clone());
-        if let Ok((result, hash)) = protocol.decode_packet(packet) {
+        let (packet, _hash) = protocol.encode_packet(msg.clone());
+        if let Ok((result, _hash)) = protocol.decode_packet(packet) {
             if let Message::FindNode(find_node) = result {
                 match msg {
                     Message::FindNode(msg_find_node) => {
@@ -260,8 +260,8 @@ mod tests {
         };
         let msg = Message::new_neighbours(vec![nr1, nr2]);
         let protocol = DiscoveryProtocol::new(SecretKey::new(&mut thread_rng()));
-        let (packet, hash) = protocol.encode_packet(msg.clone());
-        if let Ok((result, hash)) = protocol.decode_packet(packet) {
+        let (packet, _hash) = protocol.encode_packet(msg.clone());
+        if let Ok((result, _hash)) = protocol.decode_packet(packet) {
             if let Message::Neighbours(neighbours) = result {
                 match msg {
                     Message::Neighbours(msg_neighbours) => {

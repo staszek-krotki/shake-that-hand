@@ -6,9 +6,9 @@ use cipher::StreamCipher;
 use cipher::KeyIvInit;
 use secp256k1::{PublicKey, SECP256K1, SecretKey};
 use crate::crypto::{keccak256_vec, KeccakStream};
-use crate::ecies_crypto::{Aes256Ctr64BE, Ecies};
-use crate::handshake_protocol::ecdh_x;
-use crate::message;
+use crate::handshake::session::Session;
+use crate::util::ecdh_x;
+use super::ecies_crypto::{Aes256Ctr64BE, Ecies};
 
 pub const RLP_ZERO: u8 = 0x80;
 pub const RLP_EMPTY: u8 = 0xC0;
@@ -69,7 +69,7 @@ impl Rlpx {
         Ecies::encrypt(bytes, peer_public_key)
     }
 
-    pub fn build_auth_body(secret_key: &SecretKey, id: [u8; 64], nonce: [u8; 32], ephemeral_secret_key: &SecretKey, peer_public_key: &PublicKey) -> AuthBody {
+    pub fn build_auth_body(secret_key: &SecretKey, id: &[u8; 64], nonce: &[u8; 32], ephemeral_secret_key: &SecretKey, peer_public_key: &PublicKey) -> AuthBody {
         let mut x = ecdh_x(&peer_public_key, &secret_key);
 
         //x ^= nonce
@@ -88,8 +88,8 @@ impl Rlpx {
 
         let auth_body = AuthBody {
             sig: signature[..].try_into().expect("signature should fit"),
-            initiator_pubk: id,
-            initiator_nonce: nonce,
+            initiator_pubk: id.clone(),
+            initiator_nonce: nonce.clone(),
             auth_vsn: 4,
         };
 
@@ -108,6 +108,7 @@ impl Rlpx {
         }
         Err(RlpxError("Failed to decrypt Ack".to_string()))
     }
+
     fn build_ack_body(bytes: BytesMut) -> Result<AckBody, RlpxError> {
         let ack: AckBody = Decodable::decode(&mut &*bytes).map_err(|_| RlpxError("failed to decode from".to_string()))?;
         Ok(ack)
@@ -121,13 +122,8 @@ impl Rlpx {
         };
         let mac_secret = keccak256_vec(vec![ephemeral_shared_secret, &aes_secret]);
 
-        println!("egress");
-        println!("mac secret: {}", hex::encode(&mac_secret));
-        println!("aes secret: {}", hex::encode(&aes_secret));
-
-
         let iv = [0u8; 16];
-        let mut egress_aes = Aes256Ctr64BE::new(aes_secret.as_ref().into(), iv.as_ref().into());
+        let egress_aes = Aes256Ctr64BE::new(aes_secret.as_ref().into(), iv.as_ref().into());
         let mut egress_mac = KeccakStream::new(mac_secret);
 
         let mac_xor_nonce = {
@@ -148,24 +144,15 @@ impl Rlpx {
         };
         let mac_secret = keccak256_vec(vec![ephemeral_shared_secret, &aes_secret]);
 
-        println!("ingress");
-        println!("mac secret: {}", hex::encode(&mac_secret));
-        println!("aes secret: {}", hex::encode(&aes_secret));
-
-
         let iv = [0u8; 16];
-        let mut ingress_aes = Aes256Ctr64BE::new(aes_secret.as_ref().into(), iv.as_ref().into());
+        let ingress_aes = Aes256Ctr64BE::new(aes_secret.as_ref().into(), iv.as_ref().into());
         let mut ingress_mac = KeccakStream::new(mac_secret);
-
-        println!("update remote_nonce: {}", hex::encode(&nonce));
-        println!("update init msg: {}", hex::encode(&ack_message));
 
         let mac_xor_nonce = {
             let mut xor = mac_secret.clone();
             xor.iter_mut().zip(nonce).for_each(|(a, b)| *a ^= b);
             xor
         };
-        println!("update xor: {}", hex::encode(&mac_xor_nonce));
         ingress_mac.update(&mac_xor_nonce);
         ingress_mac.update(&ack_message);
         (ingress_aes, ingress_mac)
@@ -194,20 +181,19 @@ impl Rlpx {
             port: 0,
             id,
         }.encode(&mut hello_bytes);
-        println!("Herllo bytes {}", hex::encode(&hello_bytes));
         hello_bytes
     }
 
-    pub fn hello_frame(bytes: BytesMut, mut egress_aes: &mut Aes256Ctr64BE, egress_mac: &mut KeccakStream) -> BytesMut {
+    pub fn encrypt_frame(bytes: BytesMut, session: &mut Session) -> BytesMut {
         let size = bytes.len();
         let size_bytes = size.to_be_bytes();
         let mut header = [0u8; 16];
         header[0..3].copy_from_slice(&size_bytes[mem::size_of_val(&size)-3..mem::size_of_val(&size)]);
         header[3..6].copy_from_slice(&[RLP_EMPTY+2, RLP_ZERO, RLP_ZERO]); // rlp encoded 2 element array with zeros
 
-        egress_aes.apply_keystream(&mut header);
-        egress_mac.accumulate_with_xor(&header);
-        let mac_digest = egress_mac.digest();
+        session.egress_aes.apply_keystream(&mut header);
+        session.egress_mac.accumulate_with_xor(&header);
+        let mac_digest = session.egress_mac.digest();
 
         let mut output = BytesMut::new();
         output.extend_from_slice(&header);
@@ -222,21 +208,17 @@ impl Rlpx {
         output.extend_from_slice(padding.as_slice());
         let mut padded_bytes = &mut output[initial_len..];
 
-        egress_aes.apply_keystream(&mut padded_bytes);
-        egress_mac.update_accumulate_with_xor(&padded_bytes);
-        let digest = egress_mac.digest();
+        session.egress_aes.apply_keystream(&mut padded_bytes);
+        session.egress_mac.update_accumulate_with_xor(&padded_bytes);
+        let digest = session.egress_mac.digest();
 
         output.extend_from_slice(&digest);
         output
     }
 
-    pub(crate) fn read_hello_frame(mut bytes: BytesMut, ingress_aes: &mut Aes256Ctr64BE, ingress_mac: &mut KeccakStream) -> Result<(), RlpxError> {
+    pub(crate) fn read_hello_frame(mut bytes: BytesMut, ingress_aes: &mut Aes256Ctr64BE, ingress_mac: &mut KeccakStream) -> Result<BytesMut, RlpxError> {
         let (header_bytes, mac_bytes) = bytes.split_at_mut(16);
         let (mac_bytes, body) = mac_bytes.split_at_mut(16);
-        // let header = HeaderBytes::from_mut_slice(header_bytes);
-        // let mac = B128::from_slice(&mac_bytes[..16]);
-        println!("Header bytes {}", hex::encode(&header_bytes));
-        println!("Digest before apply {}", hex::encode(&ingress_mac.digest()));
 
         ingress_mac.accumulate_with_xor(header_bytes);
         let digest = ingress_mac.digest();
@@ -251,7 +233,21 @@ impl Rlpx {
         let size = usize::from_be_bytes(size_bytes);
         let padded_size = (size + 15) & !15;
 
+        let (body, _) = body.split_at_mut(padded_size + 16);
+        let (body, mac_bytes) = body.split_at_mut( body.len() - 16);
+        ingress_mac.update_accumulate_with_xor(body);
+        let digest = ingress_mac.digest();
+        if mac_bytes != digest {
+            return Err(RlpxError("digest mismatch".to_string()));
+        }
 
-        Ok(())
+        ingress_aes.apply_keystream(body);
+
+        let bytes = {
+            let mut b = BytesMut::new();
+            b.extend_from_slice(&body[0..size]);
+            b
+        };
+        Ok(bytes)
     }
 }

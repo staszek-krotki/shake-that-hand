@@ -1,4 +1,4 @@
-use crate::packet::Packet;
+use crate::discovery::packet::Packet;
 use std::net::{IpAddr, SocketAddr};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use tokio::net::UdpSocket;
@@ -22,19 +22,25 @@ impl From<NodeRecord> for NodeEndpoint {
     }
 }
 
-pub struct Net {
+pub struct DiscoveryNet {
     udp_socket: UdpSocket,
+    pub local_nr: NodeRecord,
+    pub peer_nr: NodeRecord,
 }
 
-impl Net {
-    pub(crate) async fn init(local_addresss: SocketAddr, remote_addr: SocketAddr) -> Self {
-        let udp_socket = UdpSocket::bind(local_addresss).await.unwrap();
+impl DiscoveryNet {
+    pub(crate) async fn init(local_nr: NodeRecord, peer_nr: NodeRecord) -> Self {
+        let udp_socket = UdpSocket::bind(SocketAddr::from(local_nr)).await.unwrap();
         udp_socket
-            .connect(remote_addr)
+            .connect(SocketAddr::from(peer_nr))
             .await
             .expect("should connect");
 
-        Net { udp_socket }
+        DiscoveryNet {
+            udp_socket,
+            local_nr,
+            peer_nr
+        }
     }
 
     pub(crate) async fn send(&self, packet: Packet) -> usize {

@@ -4,9 +4,9 @@ use hmac::{Hmac, Mac};
 use rand::{Rng, thread_rng};
 use secp256k1::{PublicKey, SECP256K1, SecretKey};
 use sha2::{Digest, Sha256};
-use crate::handshake_protocol::ecdh_x;
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use crate::rlpx::RlpxError;
+use crate::util::ecdh_x;
+use super::rlpx::RlpxError;
 
 
 pub type Aes128Ctr64BE = ctr::Ctr64BE<aes::Aes128>;
@@ -86,8 +86,6 @@ impl Ecies {
     pub fn decrypt(mut bytes: BytesMut, secret_key: &SecretKey) -> Result<BytesMut, RlpxError> {
         let (len_bytes, rest) = bytes.split_at_mut(2);
         let len= u16::from_be_bytes(len_bytes[0..2].try_into().unwrap());
-
-        println!("len={}, res.len={}", len, rest.len());
 
         let (r, rest) = rest.split_at_mut(65);
         let (iv, rest) = rest.split_at_mut(16);

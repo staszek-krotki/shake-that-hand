@@ -1,32 +1,23 @@
 extern crate core;
 
 mod crypto;
-mod message;
-mod net;
 mod node_record;
-mod packet;
-mod discovery_protocol;
-mod handshake_protocol;
-mod ecies_crypto;
-mod rlpx;
+mod discovery;
+mod handshake;
+mod util;
 
-use crate::crypto::{Crypto, keccak256_vec, KeccakStream};
-use crate::net::Net;
-use crate::discovery_protocol::DiscoveryProtocol;
+use crate::crypto::Crypto;
+use discovery::discovery_protocol::DiscoveryProtocol;
 use node_record::NodeRecord;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::str::FromStr;
-use std::time::Duration;
-use alloy_rlp::Encodable;
-use bytes::BytesMut;
 use rand::{Rng, thread_rng};
-use secp256k1::{SECP256K1, SecretKey, PublicKey};
-use crate::handshake_protocol::{ecdh_x, public_key_from_node_id};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use secp256k1::SecretKey;
 use tokio::net::TcpStream;
-use crate::ecies_crypto::{Aes128Ctr64BE, Aes256Ctr64BE};
-use crate::rlpx::{AckBody, Hello, Rlpx};
-use ctr::cipher::{KeyIvInit};
+use crate::discovery::net::DiscoveryNet;
+use crate::handshake::rlpx::RlpxError;
+use crate::handshake::session::Session;
+use crate::util::public_key_from_node_id;
 
 pub static MAINNET_BOOTNODES: [&str; 4] = [
     "enode://d860a01f9722d78051619d1e2351aba3f43f943f6f00718d1b9baa4101932a1f5011f16bb2b1bb35db20d6fe28fa0bf09636d26a87d31de9ec6203eeedb1f666@18.138.108.67:30303",   // bootnode-aws-ap-southeast-1-001
@@ -52,34 +43,30 @@ pub static GOERLI_BOOTNODES : [&str; 7] = [
 
 #[tokio::main]
 async fn main() {
-    // let key = Aes256Gcm::generate_key(OsRng);
     let (secret_key, id) = Crypto::init();
-    println!("pk:{:x?}", id);
     let local_addresss = SocketAddr::from_str("0.0.0.0:30302").expect("local address should be valid");
     let local_nr = NodeRecord::new(local_addresss, id);
-    let bootnode_nr = NodeRecord::from_str(MAINNET_BOOTNODES[1]).unwrap();
-    let protocol = DiscoveryProtocol::new(secret_key);
+    let bootnode_nr = NodeRecord::from_str(MAINNET_BOOTNODES[0]).unwrap();
 
-    let remote_addr = SocketAddr::from(bootnode_nr.clone());
-    let net = Net::init(local_addresss, remote_addr).await;
+    let discovery = DiscoveryProtocol::new(secret_key);
+    let discovery_net = DiscoveryNet::init(local_nr, bootnode_nr).await;
 
-    protocol.init_discovery(local_nr, bootnode_nr, &net).await;
-    // let neighbours = protocol.discover_neighbours(id, &net).await;
-    let neighbours = vec![
-        NodeRecord {
-            ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 6)),
-            tcp_port: 30303,
-            udp_port: 30303,
-            // node_id: [246, 194, 19, 37, 18, 163, 91, 149, 233, 28, 172, 75, 136, 247, 75, 12, 178, 249, 101, 119, 150, 2, 125, 151, 6, 225, 99, 103, 254, 248, 11, 33, 208, 220, 44, 238, 215, 202, 77, 217, 160, 23, 37, 243, 58, 31, 112, 71, 20, 72, 95, 126, 161, 170, 167, 27, 110, 44, 172, 19, 145, 69, 96, 166],
-            node_id: [250, 1, 136, 105, 14, 101, 175, 6, 148, 54, 58, 72, 99, 37, 146, 51, 183, 65, 197, 45, 243, 138, 229, 250, 192, 114, 38, 78, 237, 176, 18, 81, 132, 118, 118, 237, 126, 44, 240, 10, 120, 205, 205, 162, 48, 238, 62, 84, 34, 175, 248, 9, 89, 127, 46, 58, 146, 142, 159, 179, 66, 69, 105, 143]
-        }
-    ];
+    discovery.init(&discovery_net).await;
+
+    let mut neighbours = discovery.find_neighbours(id, &discovery_net).await;
+    neighbours.extend_from_within(..);
+    // let neighbour_enode = "enode://a963662828fb26fc7a5c0ad1a167efe69de6815b3230538dc6f3f0b964da12f833f261e8a819dea9f8eed5c308343b0ea4f2f97d7f385ea6fc356d08aba9495f@127.0.0.1:30303";
+    //
+    // let n = NodeRecord::from(Url::parse(neighbour_enode).unwrap());
+    // let mut neighbours = vec![
+    //     n,
+    //     n
+    // ];
     println!("discovery done");
 
     let mut rng = thread_rng();
     let nonce: [u8; 32] = rng.gen();
     let ephemeral_secret_key = SecretKey::new(&mut rng);
-    let ephemeral_public_key = PublicKey::from_secret_key(SECP256K1, &ephemeral_secret_key);
 
     for peer in neighbours {
         if let Ok(peer_public_key) = public_key_from_node_id(&peer.node_id) {
@@ -89,63 +76,33 @@ async fn main() {
             let socket_address = SocketAddr::new(peer.ip, peer.tcp_port);
             match TcpStream::connect(socket_address).await {
                 Ok(mut tcp_stream) => {
-                    let auth_body = Rlpx::build_auth_body(&secret_key, id, nonce, &ephemeral_secret_key, &peer_public_key);
-                    let encrypted_body = Rlpx::encrypt_auth_body(auth_body, &[0u8; 4], &peer_public_key);
-                    let auth = Rlpx::build_auth(encrypted_body);
-                    let auth_message = auth.clone();
 
-                    tcp_stream.write_all(&auth).await.expect("should be sent");
+                    let auth_bytes = match handshake::handshake_protocol::send_auth(&mut tcp_stream, &secret_key, &id, &nonce, &ephemeral_secret_key, &peer_public_key).await {
+                        Ok(auth_bytes) => auth_bytes,
+                        Err(e) => {
+                            println!("Sending Auth failed {:?}", e);
+                            continue
+                        }
+                    };
 
-                    let mut buf = BytesMut::with_capacity(4*1024*1024);
-                    // let read = tokio::time::timeout(Duration::from_millis(3000), tcp_stream.read_to_end(&mut buf)).await;
-                    let read = tokio::time::timeout(Duration::from_millis(300000), tcp_stream.read_buf(&mut buf)).await;
-                    if let Ok(Ok(read)) = read {
-                        let ack_message = {
-                            if read == 0 {
-                                BytesMut::new()
+                    match handshake::handshake_protocol::read_ack(&mut tcp_stream, &secret_key).await {
+                        Ok((ack, ack_bytes)) => {
+                            let mut session = Session::new(ack, &ephemeral_secret_key, &nonce, &auth_bytes, &ack_bytes);
+                            if let Err(e) = handshake::handshake_protocol::send_hello(&mut tcp_stream, &mut session, &id).await {
+                                println!("Sending hello failed: {:?}", e);
+                                continue
                             }
-                            else {
-                                let payload_size = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                                let mut bytes = buf.clone();
-                                bytes.split_to(payload_size + 2)
+                            // Wait for Hello response
+                            let hello_result = handshake::handshake_protocol::read_hello(&mut tcp_stream, session).await;
+                            match hello_result {
+                                Ok(hello) => println!("Handshake succeeded with {}", hello.client_version),
+                                Err(RlpxError(e)) => println!("Handshake failed: {}", e),
                             }
-                        };
-                        println!("read {} bytes into {} bytes of buf", read, buf.len());
-                        match Rlpx::decrypt_ack(buf, &secret_key).await {
-                            Ok(ack) => {
-                                let recipient_ephemeral_public_key = public_key_from_node_id(&ack.recipient_ephemeral_public_key).unwrap();
-                                let ephemeral_shared_secret = ecdh_x(&recipient_ephemeral_public_key, &ephemeral_secret_key);
-
-                                let (mut egress_aes, mut egress_mac) = Rlpx::egress_hashers(&nonce, &auth_message, &ack, &ephemeral_shared_secret);
-                                let (mut ingress_aes, mut ingress_mac) = Rlpx::ingress_hashers(&nonce, &ack_message, &ack, &ephemeral_shared_secret);
-
-                                let hello_bytes = Rlpx::build_hello(id.clone());
-                                let frame = Rlpx::hello_frame(hello_bytes, &mut egress_aes, &mut egress_mac);
-
-                                tcp_stream.write_all(&frame).await.expect("frame should be sent");
-
-                                let mut buf = BytesMut::with_capacity(4*1024*1024);
-                                // let read = tokio::time::timeout(Duration::from_millis(3000), tcp_stream.read_to_end(&mut buf)).await;
-                                let read: Result<Result<usize, std::io::Error>, std::io::Error> = Ok(tcp_stream.read_buf(&mut buf).await);
-                                match read {
-                                    Ok(Ok(read)) => {
-                                        println!("Hello response read {}", read);
-                                        Rlpx::read_hello_frame(buf, &mut ingress_aes, &mut ingress_mac);
-                                    }
-                                    Ok(Err(e)) => {
-                                        println!("Hello response failed {:?}", e);
-                                    }
-                                    Err(e) => {
-                                        println!("Hello response failed {:?}", e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("Failed to decrypt ack: {:?}", e);
-                            }
+                        },
+                        Err(e) => {
+                            println!("Reading Ack failed: {:?}", e);
                         }
                     }
-
                 }
                 Err(e) => {
                     println!("Couldn't connect: {}", e);

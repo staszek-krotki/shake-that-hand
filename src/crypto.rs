@@ -12,7 +12,6 @@ impl Crypto {
     pub(crate) fn init() -> (SecretKey, [u8; 64]) {
         // let secret_key = SecretKey::new(&mut rand::thread_rng());
         let secret_key = SecretKey::from_str("351bd6c4ca72b468c1a11707505911a766271466aab7cb1d3a9e0d114430bd25").unwrap();
-        println!("SecretKey: {:?}", secret_key.display_secret());
         let public_key = secp256k1::PublicKey::from_secret_key(SECP256K1, &secret_key);
         let id: [u8; 64] = public_key.serialize_uncompressed()[1..]
             .try_into()
@@ -61,43 +60,28 @@ impl KeccakStream {
     }
 
     pub fn accumulate_with_xor(&mut self, bytes: &[u8]) {
-        println!("[update_header]: secret: {}", hex::encode(&self.secret));
-        println!("[update_header]: data: {}", hex::encode(bytes));
-
         let aes_enc = Aes256Enc::new_from_slice(self.secret.as_ref()).unwrap();
         let mut encrypted = self.digest();
-
-        println!("[update_header]: digest: {}", hex::encode(&encrypted));
 
         aes_enc.encrypt_padded::<NoPadding>(&mut encrypted, 16).unwrap();
         for i in 0..bytes.len() {
             encrypted[i] ^= bytes[i];
         }
 
-        println!("[update_header]: update: {}", hex::encode(&encrypted));
-
-
         self.update(encrypted.as_ref());
     }
 
     pub fn update_accumulate_with_xor(&mut self, bytes: &[u8]) {
-        println!("[update_body]: secret: {}", hex::encode(&self.secret));
-        println!("[update_body]: data: {}", hex::encode(bytes));
-
         self.update(bytes);
         let digest = self.digest();
-        println!("[update_body]: prev: {}", hex::encode(&digest));
-
 
         let aes_enc = Aes256Enc::new_from_slice(self.secret.as_ref()).unwrap();
         let mut encrypted = digest.clone();
-        println!("[update_body]: encrypted: {}", hex::encode(&encrypted));
 
         aes_enc.encrypt_padded::<NoPadding>(&mut encrypted, 16).unwrap();
         for i in 0..digest.len() {
             encrypted[i] ^= digest[i];
         }
-        println!("[update_body]: update: {}", hex::encode(&encrypted));
 
         self.update(encrypted.as_ref());
     }
