@@ -29,8 +29,8 @@ pub struct DiscoveryNet {
 }
 
 impl DiscoveryNet {
-    pub(crate) async fn init(local_nr: NodeRecord, peer_nr: NodeRecord) -> Self {
-        let udp_socket = UdpSocket::bind(SocketAddr::from(local_nr)).await.unwrap();
+    pub(crate) async fn init(local_nr: NodeRecord, peer_nr: &NodeRecord) -> Self {
+        let udp_socket = UdpSocket::bind(SocketAddr::from(&local_nr)).await.unwrap();
         udp_socket
             .connect(SocketAddr::from(peer_nr))
             .await
@@ -39,7 +39,7 @@ impl DiscoveryNet {
         DiscoveryNet {
             udp_socket,
             local_nr,
-            peer_nr
+            peer_nr: *peer_nr
         }
     }
 

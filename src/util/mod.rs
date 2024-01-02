@@ -1,3 +1,5 @@
+pub mod cli;
+
 use bytes::{BufMut, BytesMut};
 use secp256k1::{Error, PublicKey, SecretKey};
 

@@ -17,7 +17,10 @@ use tokio::net::TcpStream;
 use crate::discovery::net::DiscoveryNet;
 use crate::handshake::rlpx::RlpxError;
 use crate::handshake::session::Session;
+use crate::util::cli::Cli;
 use crate::util::public_key_from_node_id;
+use clap::Parser;
+use url::Url;
 
 pub static MAINNET_BOOTNODES: [&str; 4] = [
     "enode://d860a01f9722d78051619d1e2351aba3f43f943f6f00718d1b9baa4101932a1f5011f16bb2b1bb35db20d6fe28fa0bf09636d26a87d31de9ec6203eeedb1f666@18.138.108.67:30303",   // bootnode-aws-ap-southeast-1-001
@@ -43,32 +46,20 @@ pub static GOERLI_BOOTNODES : [&str; 7] = [
 
 #[tokio::main]
 async fn main() {
+    let args = Cli::parse();
+
     let (secret_key, id) = Crypto::init();
     let local_addresss = SocketAddr::from_str("0.0.0.0:30302").expect("local address should be valid");
     let local_nr = NodeRecord::new(local_addresss, id);
-    let bootnode_nr = NodeRecord::from_str(MAINNET_BOOTNODES[0]).unwrap();
-
     let discovery = DiscoveryProtocol::new(secret_key);
-    let discovery_net = DiscoveryNet::init(local_nr, bootnode_nr).await;
 
-    discovery.init(&discovery_net).await;
-
-    let mut neighbours = discovery.find_neighbours(id, &discovery_net).await;
-    neighbours.extend_from_within(..);
-    // let neighbour_enode = "enode://a963662828fb26fc7a5c0ad1a167efe69de6815b3230538dc6f3f0b964da12f833f261e8a819dea9f8eed5c308343b0ea4f2f97d7f385ea6fc356d08aba9495f@127.0.0.1:30303";
-    //
-    // let n = NodeRecord::from(Url::parse(neighbour_enode).unwrap());
-    // let mut neighbours = vec![
-    //     n,
-    //     n
-    // ];
-    println!("discovery done");
+    let peers = init_peers(args, id, local_nr, &discovery).await;
 
     let mut rng = thread_rng();
     let nonce: [u8; 32] = rng.gen();
     let ephemeral_secret_key = SecretKey::new(&mut rng);
 
-    for peer in neighbours {
+    for peer in peers {
         if let Ok(peer_public_key) = public_key_from_node_id(&peer.node_id) {
             let remote_address = SocketAddr::new(peer.ip, peer.udp_port);
             println!("Peer: {}", remote_address);
@@ -95,7 +86,10 @@ async fn main() {
                             // Wait for Hello response
                             let hello_result = handshake::handshake_protocol::read_hello(&mut tcp_stream, session).await;
                             match hello_result {
-                                Ok(hello) => println!("Handshake succeeded with {}", hello.client_version),
+                                Ok(hello) => {
+                                    println!("Handshake succeeded with {}", hello.client_version);
+                                    return;
+                                },
                                 Err(RlpxError(e)) => println!("Handshake failed: {}", e),
                             }
                         },
@@ -112,6 +106,32 @@ async fn main() {
     }
 
     ()
+}
+
+async fn init_peers(args: Cli, id: [u8; 64], local_nr: NodeRecord, discovery: &DiscoveryProtocol) -> Vec<NodeRecord> {
+    let mut peers = vec![];
+
+    if let Some(enode) = args.enode {
+        // let enode = "enode://a963662828fb26fc7a5c0ad1a167efe69de6815b3230538dc6f3f0b964da12f833f261e8a819dea9f8eed5c308343b0ea4f2f97d7f385ea6fc356d08aba9495f@127.0.0.1:30303";
+        peers.push(NodeRecord::from(Url::parse(enode.as_ref()).unwrap()));
+    }
+
+    if args.crawl {
+        let bootnode_nr=
+            if peers.len() == 0 {
+                NodeRecord::from(Url::parse(MAINNET_BOOTNODES[0]).unwrap())
+            }
+            else {
+                peers.pop().unwrap()
+            };
+
+        let discovery_net = DiscoveryNet::init(local_nr, &bootnode_nr).await;
+        discovery.init(&discovery_net).await;
+
+        let neighbours = discovery.find_neighbours(id, &discovery_net).await;
+        peers.extend_from_slice(neighbours.as_slice());
+    }
+    peers
 }
 
 

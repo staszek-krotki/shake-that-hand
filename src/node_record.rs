@@ -43,8 +43,8 @@ impl FromStr for NodeRecord {
     }
 }
 
-impl From<NodeRecord> for SocketAddr {
-    fn from(nr: NodeRecord) -> Self {
+impl From<&NodeRecord> for SocketAddr {
+    fn from(nr: &NodeRecord) -> Self {
         let addr_v4 = match nr.ip {
             IpAddr::V4(a) => a,
             IpAddr::V6(_) => panic!("V6 is not supported"),
