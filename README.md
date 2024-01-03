@@ -20,7 +20,7 @@ For Geth:
 ```
 wget wget https://gethstore.blob.core.windows.net/builds/geth-linux-amd64-1.13.8-b20b4a71.tar.gz
 tar xvf geth-linux-amd64-1.13.8-b20b4a71.tar.gz
-cd tar xvf geth-linux-amd64-1.13.8-b20b4a71
+cd geth-linux-amd64-1.13.8-b20b4a71
 ./geth
 ```
 
